@@ -1,0 +1,16 @@
+[package]
+name = "mono-uart-recovery-stub"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mono-uart-recovery-stub"
+path = "src/main.rs"
+
+[[bin]]
+name = "mono-uart-recovery-stage1"
+path = "src/stage1.rs"
+
+[dependencies]
+mono-uart-recovery-protocol = { path = "../protocol" }

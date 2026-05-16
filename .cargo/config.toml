@@ -1,0 +1,6 @@
+[target.aarch64-unknown-none]
+rustflags = [
+    "-C", "link-arg=-Tstub/memory.x",
+    "-C", "link-arg=--gc-sections",
+    "-C", "relocation-model=static",
+]
