@@ -10,3 +10,4 @@ path = "src/main.rs"
 
 [dependencies]
 mono-uart-recovery-protocol = { path = "../protocol" }
+serial2 = "0.2.37"

@@ -1,12 +1,10 @@
-mod serial;
-
 use mono_uart_recovery_protocol as proto;
-use serial::SerialPort;
+use serial2::SerialPort;
 use std::env;
 use std::error::Error;
 use std::fmt;
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -180,6 +178,11 @@ fn run() -> Result<()> {
 
 fn open_client(device: &str, baud: u32) -> Result<Client> {
     let serial = SerialPort::open(device, baud)
+        .and_then(|mut serial| {
+            serial.set_write_timeout(REQUEST_IDLE_TIMEOUT)?;
+            serial.discard_buffers()?;
+            Ok(serial)
+        })
         .map_err(|err| AppError::new(format!("failed to open {device} at {baud} baud: {err}")))?;
     Ok(Client::new(serial))
 }
@@ -241,7 +244,7 @@ impl Client {
             } else {
                 idle_deadline
             };
-            let Some(byte) = self.serial.read_byte_until(deadline)? else {
+            let Some(byte) = read_byte_until(&mut self.serial, deadline)? else {
                 hexdump.flush();
                 continue;
             };
@@ -483,13 +486,14 @@ impl Client {
         let mut slip = vec![0u8; proto::slip_encoded_len(&frame[..frame_len])];
         let slip_len = proto::slip_encode(&frame[..frame_len], &mut slip)
             .map_err(|err| AppError::new(format!("failed to encode slip frame: {err:?}")))?;
-        self.serial.write_all_retry(&slip[..slip_len])?;
+        Write::write_all(&mut self.serial, &slip[..slip_len])?;
+        Write::flush(&mut self.serial)?;
         Ok(())
     }
 
     fn recv_frame_until(&mut self, deadline: Instant) -> Result<Option<Frame>> {
         loop {
-            let Some(byte) = self.serial.read_byte_until(deadline)? else {
+            let Some(byte) = read_byte_until(&mut self.serial, deadline)? else {
                 return Ok(None);
             };
 
@@ -509,6 +513,17 @@ impl Client {
                 }
             }
         }
+    }
+}
+
+fn read_byte_until(serial: &mut SerialPort, deadline: Instant) -> io::Result<Option<u8>> {
+    serial.set_read_timeout(deadline.saturating_duration_since(Instant::now()))?;
+
+    let mut byte = [0u8; 1];
+    match Read::read_exact(serial, &mut byte) {
+        Ok(()) => Ok(Some(byte[0])),
+        Err(err) if err.kind() == io::ErrorKind::TimedOut => Ok(None),
+        Err(err) => Err(err),
     }
 }
 
