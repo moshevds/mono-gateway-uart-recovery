@@ -4,13 +4,46 @@ use std::env;
 use std::error::Error;
 use std::fmt;
 use std::fs::{self, File};
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 type Result<T> = std::result::Result<T, AppError>;
 
 const REQUEST_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+const MIB: u32 = 1024 * 1024;
+const NOR_PARTITIONS: [NorPartition; 6] = [
+    NorPartition {
+        name: "rcw-bl2",
+        offset: 0,
+        size: NorPartitionSize::Bytes(MIB),
+    },
+    NorPartition {
+        name: "uboot",
+        offset: MIB,
+        size: NorPartitionSize::Bytes(2 * MIB),
+    },
+    NorPartition {
+        name: "uboot-env",
+        offset: 3 * MIB,
+        size: NorPartitionSize::Bytes(MIB),
+    },
+    NorPartition {
+        name: "fman-ucode",
+        offset: 4 * MIB,
+        size: NorPartitionSize::Bytes(MIB),
+    },
+    NorPartition {
+        name: "recovery-dtb",
+        offset: 5 * MIB,
+        size: NorPartitionSize::Bytes(MIB),
+    },
+    NorPartition {
+        name: "kernel-initramfs",
+        offset: 10 * MIB,
+        size: NorPartitionSize::Rest,
+    },
+];
 
 #[derive(Debug)]
 struct AppError(String);
@@ -58,6 +91,7 @@ enum Command {
         offset: u32,
         erase: bool,
         verify: bool,
+        selector: RestoreSelector,
     },
     Verify {
         input: PathBuf,
@@ -78,6 +112,53 @@ enum LengthArg {
     Image,
     Full,
     Bytes(u32),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RestoreSelector {
+    WholeImage,
+    ByteRange(InclusiveByteRange),
+    Partitions(Vec<String>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InclusiveByteRange {
+    start: u32,
+    end: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SourceRange {
+    offset: u32,
+    len: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RestoreRange {
+    image_offset: u32,
+    flash_offset: u32,
+    write_len: u32,
+    erase_len: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NorPartition {
+    name: &'static str,
+    offset: u32,
+    size: NorPartitionSize,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum NorPartitionSize {
+    Bytes(u32),
+    Rest,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct VerifiedRange {
+    flash_offset: u32,
+    len: u32,
+    expected_crc32: u32,
 }
 
 #[derive(Debug)]
@@ -161,7 +242,8 @@ fn run() -> Result<()> {
             offset,
             erase,
             verify,
-        } => restore(&mut client, &info, input, offset, erase, verify)?,
+            selector,
+        } => restore(&mut client, &info, input, offset, erase, verify, selector)?,
         Command::Verify { input, offset } => verify_file(&mut client, &info, input, offset)?,
         Command::Erase { offset, length } => erase_only(&mut client, &info, offset, length)?,
         Command::Crc32 { offset, length } => {
@@ -679,13 +761,18 @@ fn restore(
     offset: u32,
     erase: bool,
     verify: bool,
+    selector: RestoreSelector,
 ) -> Result<()> {
     let file_len = fs::metadata(&input)?.len();
     if file_len > u64::from(u32::MAX) {
         return Err(AppError::new("input image is too large for this protocol"));
     }
     let file_len = file_len as u32;
-    check_range(info.flash_size, offset, file_len)?;
+    let ranges = resolve_restore_ranges(info, offset, file_len, &selector)?;
+    let total_write = ranges
+        .iter()
+        .try_fold(0u32, |total, range| total.checked_add(range.write_len))
+        .ok_or_else(|| AppError::new("selected restore ranges are too large"))?;
 
     if file_len != info.image_size {
         eprintln!(
@@ -695,50 +782,97 @@ fn restore(
     }
 
     if erase {
-        if offset % info.erase_size != 0 {
-            return Err(AppError::new(format!(
-                "restore offset 0x{offset:08x} is not erase-sector aligned ({})",
-                info.erase_size
-            )));
+        for range in &ranges {
+            if range.flash_offset % info.erase_size != 0 {
+                return Err(AppError::new(format!(
+                    "restore offset 0x{:08x} is not erase-sector aligned ({})",
+                    range.flash_offset, info.erase_size
+                )));
+            }
+            if range.erase_len == 0 || range.erase_len % info.erase_size != 0 {
+                return Err(AppError::new(format!(
+                    "erase length {} at NOR offset 0x{:08x} is not a non-zero multiple of erase-sector size {}",
+                    range.erase_len, range.flash_offset, info.erase_size
+                )));
+            }
+            check_range(info.flash_size, range.flash_offset, range.erase_len)?;
+            eprintln!(
+                "erasing {} bytes at NOR offset 0x{:08x}",
+                range.erase_len, range.flash_offset
+            );
+            client.erase(range.flash_offset, range.erase_len)?;
         }
-        let erase_len = align_up(file_len, info.erase_size)?;
-        check_range(info.flash_size, offset, erase_len)?;
-        eprintln!("erasing {} bytes at NOR offset 0x{offset:08x}", erase_len);
-        client.erase(offset, erase_len)?;
     }
 
     let chunk = usize::from(info.max_data).clamp(1, proto::MAX_DATA_LEN);
     let mut reader = BufReader::new(File::open(&input)?);
     let mut buf = vec![0u8; chunk];
-    let mut done = 0u32;
-    let mut crc_state = proto::crc32_init();
+    let mut total_done = 0u32;
+    let mut verified_ranges = Vec::with_capacity(ranges.len());
 
-    eprintln!(
-        "writing {} bytes from {} to NOR offset 0x{offset:08x}",
-        file_len,
-        input.display()
-    );
+    if ranges.len() == 1 {
+        let range = ranges[0];
+        eprintln!(
+            "writing {} bytes from {} offset 0x{:08x} to NOR offset 0x{:08x}",
+            range.write_len,
+            input.display(),
+            range.image_offset,
+            range.flash_offset
+        );
+    } else {
+        eprintln!(
+            "writing {} bytes from {} across {} NOR ranges",
+            total_write,
+            input.display(),
+            ranges.len()
+        );
+    }
 
-    while done < file_len {
-        let this_len = chunk.min((file_len - done) as usize);
-        reader.read_exact(&mut buf[..this_len])?;
-        crc_state = proto::crc32_update_state(crc_state, &buf[..this_len]);
-        client.write_flash(offset + done, &buf[..this_len])?;
-        done += this_len as u32;
-        print_progress("write", done, file_len);
+    for range in &ranges {
+        reader.seek(SeekFrom::Start(u64::from(range.image_offset)))?;
+        let mut range_done = 0u32;
+        let mut crc_state = proto::crc32_init();
+
+        while range_done < range.write_len {
+            let this_len = chunk.min((range.write_len - range_done) as usize);
+            reader.read_exact(&mut buf[..this_len])?;
+            crc_state = proto::crc32_update_state(crc_state, &buf[..this_len]);
+            client.write_flash(range.flash_offset + range_done, &buf[..this_len])?;
+            range_done += this_len as u32;
+            total_done += this_len as u32;
+            print_progress("write", total_done, total_write);
+        }
+
+        verified_ranges.push(VerifiedRange {
+            flash_offset: range.flash_offset,
+            len: range.write_len,
+            expected_crc32: proto::crc32_finish(crc_state),
+        });
     }
     eprintln!();
 
     if verify {
-        let expected = proto::crc32_finish(crc_state);
-        eprintln!("verifying device CRC32 over written range...");
-        let actual = client.crc32(offset, file_len, "verify")?;
-        if actual != expected {
-            return Err(AppError::new(format!(
-                "verify failed: host crc32=0x{expected:08x}, device crc32=0x{actual:08x}"
-            )));
+        if verified_ranges.len() == 1 {
+            eprintln!("verifying device CRC32 over written range...");
+        } else {
+            eprintln!(
+                "verifying device CRC32 over {} written ranges...",
+                verified_ranges.len()
+            );
         }
-        eprintln!("verify ok: crc32=0x{actual:08x}");
+        for range in &verified_ranges {
+            let actual = client.crc32(range.flash_offset, range.len, "verify")?;
+            if actual != range.expected_crc32 {
+                return Err(AppError::new(format!(
+                    "verify failed at NOR offset 0x{:08x}: host crc32=0x{:08x}, device crc32=0x{actual:08x}",
+                    range.flash_offset, range.expected_crc32
+                )));
+            }
+            eprintln!(
+                "verify ok: offset=0x{:08x} length={} crc32=0x{actual:08x}",
+                range.flash_offset, range.len
+            );
+        }
     }
 
     Ok(())
@@ -838,6 +972,166 @@ fn check_range(flash_size: u32, offset: u32, length: u32) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+fn check_input_range(file_len: u32, offset: u32, length: u32) -> Result<()> {
+    let end = u64::from(offset) + u64::from(length);
+    if end > u64::from(file_len) {
+        return Err(AppError::new(format!(
+            "range 0x{offset:08x}..0x{end:08x} exceeds input image length 0x{file_len:08x}"
+        )));
+    }
+    Ok(())
+}
+
+fn resolve_restore_ranges(
+    info: &proto::DeviceInfo,
+    flash_base_offset: u32,
+    file_len: u32,
+    selector: &RestoreSelector,
+) -> Result<Vec<RestoreRange>> {
+    let source_ranges = match selector {
+        RestoreSelector::WholeImage => vec![SourceRange {
+            offset: 0,
+            len: file_len,
+        }],
+        RestoreSelector::ByteRange(range) => {
+            vec![source_range_for_byte_range(info, file_len, *range)?]
+        }
+        RestoreSelector::Partitions(names) => {
+            let mut ranges = Vec::with_capacity(names.len());
+            for name in names {
+                ranges.push(source_range_for_partition(file_len, name)?);
+            }
+            ranges
+        }
+    };
+
+    let source_ranges = coalesce_source_ranges(source_ranges)?;
+    let mut restore_ranges = Vec::with_capacity(source_ranges.len());
+    for source in source_ranges {
+        check_input_range(file_len, source.offset, source.len)?;
+        let flash_offset = checked_add_u32(flash_base_offset, source.offset).ok_or_else(|| {
+            AppError::new(format!(
+                "restore target offset overflows: 0x{flash_base_offset:08x} + 0x{:08x}",
+                source.offset
+            ))
+        })?;
+        check_range(info.flash_size, flash_offset, source.len)?;
+        restore_ranges.push(RestoreRange {
+            image_offset: source.offset,
+            flash_offset,
+            write_len: source.len,
+            erase_len: align_up(source.len, info.erase_size)?,
+        });
+    }
+    Ok(restore_ranges)
+}
+
+fn source_range_for_byte_range(
+    info: &proto::DeviceInfo,
+    file_len: u32,
+    range: InclusiveByteRange,
+) -> Result<SourceRange> {
+    if info.erase_size == 0 {
+        return Err(AppError::new("device reported zero erase size"));
+    }
+    if range.end < range.start {
+        return Err(AppError::new(format!(
+            "byte range start 0x{:08x} is after end 0x{:08x}",
+            range.start, range.end
+        )));
+    }
+
+    let start = range.start - (range.start % info.erase_size);
+    let end_exclusive = range
+        .end
+        .checked_add(1)
+        .ok_or_else(|| AppError::new("byte range end is too large"))?;
+    let end = align_up(end_exclusive, info.erase_size)?;
+    let len = end.checked_sub(start).ok_or_else(|| {
+        AppError::new(format!(
+            "byte range 0x{:08x}..0x{:08x} cannot be aligned to erase sectors",
+            range.start, range.end
+        ))
+    })?;
+    check_input_range(file_len, start, len)?;
+    Ok(SourceRange { offset: start, len })
+}
+
+fn source_range_for_partition(file_len: u32, name: &str) -> Result<SourceRange> {
+    let partition = find_nor_partition(name).ok_or_else(|| {
+        AppError::new(format!(
+            "unknown NOR partition '{name}'; known partitions: {}",
+            known_partition_names()
+        ))
+    })?;
+    let end = match partition.size {
+        NorPartitionSize::Bytes(len) => checked_add_u32(partition.offset, len)
+            .ok_or_else(|| AppError::new(format!("partition {name} has an overflowing range")))?,
+        NorPartitionSize::Rest => file_len,
+    };
+    if end <= partition.offset {
+        return Err(AppError::new(format!(
+            "partition {name} starts at 0x{:08x}, beyond input image length 0x{file_len:08x}",
+            partition.offset
+        )));
+    }
+    if end > file_len {
+        return Err(AppError::new(format!(
+            "partition {name} ends at 0x{end:08x}, beyond input image length 0x{file_len:08x}"
+        )));
+    }
+    Ok(SourceRange {
+        offset: partition.offset,
+        len: end - partition.offset,
+    })
+}
+
+fn coalesce_source_ranges(mut ranges: Vec<SourceRange>) -> Result<Vec<SourceRange>> {
+    ranges.retain(|range| range.len != 0);
+    ranges.sort_by_key(|range| range.offset);
+
+    let mut out: Vec<SourceRange> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        if let Some(last) = out.last_mut() {
+            let last_end = u64::from(last.offset) + u64::from(last.len);
+            let range_end = u64::from(range.offset) + u64::from(range.len);
+            if u64::from(range.offset) <= last_end {
+                let merged_end = last_end.max(range_end);
+                last.len = (merged_end - u64::from(last.offset)) as u32;
+                continue;
+            }
+        }
+        out.push(range);
+    }
+
+    if out.is_empty() {
+        return Err(AppError::new("selected restore range is empty"));
+    }
+    Ok(out)
+}
+
+fn find_nor_partition(name: &str) -> Option<NorPartition> {
+    NOR_PARTITIONS
+        .iter()
+        .copied()
+        .find(|partition| partition.name == name)
+}
+
+fn known_partition_names() -> String {
+    let mut out = String::new();
+    for (index, partition) in NOR_PARTITIONS.iter().enumerate() {
+        if index != 0 {
+            out.push_str(", ");
+        }
+        out.push_str(partition.name);
+    }
+    out
+}
+
+fn checked_add_u32(lhs: u32, rhs: u32) -> Option<u32> {
+    lhs.checked_add(rhs)
 }
 
 fn align_up(value: u32, align: u32) -> Result<u32> {
@@ -1051,6 +1345,7 @@ fn parse_command(args: &[String]) -> Result<Command> {
             let mut offset = 0;
             let mut erase = true;
             let mut verify = true;
+            let mut selector = None;
             let mut input = None;
             let mut i = 1;
             while i < args.len() {
@@ -1061,8 +1356,46 @@ fn parse_command(args: &[String]) -> Result<Command> {
                     }
                     "--no-erase" => erase = false,
                     "--no-verify" => verify = false,
+                    "--byte-range" => {
+                        i += 1;
+                        set_restore_selector(
+                            &mut selector,
+                            RestoreSelector::ByteRange(parse_byte_range_arg(require_arg(
+                                args,
+                                i,
+                                "--byte-range",
+                            )?)?),
+                        )?;
+                    }
+                    "--partitions" => {
+                        i += 1;
+                        set_restore_selector(
+                            &mut selector,
+                            RestoreSelector::Partitions(parse_partition_list(require_arg(
+                                args,
+                                i,
+                                "--partitions",
+                            )?)?),
+                        )?;
+                    }
                     arg if arg.starts_with("--offset=") => {
                         offset = parse_size_u32(&arg["--offset=".len()..])?;
+                    }
+                    arg if arg.starts_with("--byte-range=") => {
+                        set_restore_selector(
+                            &mut selector,
+                            RestoreSelector::ByteRange(parse_byte_range_arg(
+                                &arg["--byte-range=".len()..],
+                            )?),
+                        )?;
+                    }
+                    arg if arg.starts_with("--partitions=") => {
+                        set_restore_selector(
+                            &mut selector,
+                            RestoreSelector::Partitions(parse_partition_list(
+                                &arg["--partitions=".len()..],
+                            )?),
+                        )?;
                     }
                     arg if arg.starts_with('-') => {
                         return Err(AppError::new(format!("unknown restore option: {arg}")));
@@ -1081,6 +1414,7 @@ fn parse_command(args: &[String]) -> Result<Command> {
                 offset,
                 erase,
                 verify,
+                selector: selector.unwrap_or(RestoreSelector::WholeImage),
             })
         }
         "verify" => {
@@ -1181,6 +1515,61 @@ fn require_arg<'a>(args: &'a [String], index: usize, flag: &str) -> Result<&'a s
         .ok_or_else(|| AppError::new(format!("{flag} requires a value")))
 }
 
+fn set_restore_selector(
+    slot: &mut Option<RestoreSelector>,
+    selector: RestoreSelector,
+) -> Result<()> {
+    if slot.is_some() {
+        return Err(AppError::new(
+            "restore accepts only one of --byte-range or --partitions",
+        ));
+    }
+    *slot = Some(selector);
+    Ok(())
+}
+
+fn parse_byte_range_arg(input: &str) -> Result<InclusiveByteRange> {
+    let (start, end) = input
+        .split_once("..")
+        .ok_or_else(|| AppError::new("byte range must use START..END"))?;
+    if end.contains("..") {
+        return Err(AppError::new("byte range must contain exactly one '..'"));
+    }
+    let start = parse_size_u32(start)?;
+    let end = parse_size_u32(end)?;
+    if end < start {
+        return Err(AppError::new(format!(
+            "byte range start 0x{start:08x} is after end 0x{end:08x}"
+        )));
+    }
+    Ok(InclusiveByteRange { start, end })
+}
+
+fn parse_partition_list(input: &str) -> Result<Vec<String>> {
+    let mut names = Vec::new();
+    for raw_name in input.split(',') {
+        let name = raw_name.trim();
+        if name.is_empty() {
+            return Err(AppError::new(
+                "--partitions contains an empty partition name",
+            ));
+        }
+        if find_nor_partition(name).is_none() {
+            return Err(AppError::new(format!(
+                "unknown NOR partition '{name}'; known partitions: {}",
+                known_partition_names()
+            )));
+        }
+        names.push(name.to_string());
+    }
+    if names.is_empty() {
+        return Err(AppError::new(
+            "--partitions requires at least one partition",
+        ));
+    }
+    Ok(names)
+}
+
 fn parse_length_arg(input: &str) -> Result<LengthArg> {
     match input {
         "image" => Ok(LengthArg::Image),
@@ -1229,9 +1618,141 @@ fn print_usage() {
         "Usage:
   mono-uart-recovery --device /dev/ttyUSB0 [--stage1 mono-uart-recovery-stage1.bin] [--baud 115200] [--fast-baud 921600] [--no-fast-uart] info
   mono-uart-recovery --device /dev/ttyUSB0 [--stage1 mono-uart-recovery-stage1.bin] [--fast-baud 921600] backup <out.bin> [--length image|full|SIZE] [--offset SIZE]
-  mono-uart-recovery --device /dev/ttyUSB0 [--stage1 mono-uart-recovery-stage1.bin] [--fast-baud 921600] restore <firmware-qspi.bin> [--offset SIZE] [--no-erase] [--no-verify]
+  mono-uart-recovery --device /dev/ttyUSB0 [--stage1 mono-uart-recovery-stage1.bin] [--fast-baud 921600] restore <firmware-qspi.bin> [--offset SIZE] [--byte-range START..END | --partitions NAME[,NAME...]] [--no-erase] [--no-verify]
   mono-uart-recovery --device /dev/ttyUSB0 [--stage1 mono-uart-recovery-stage1.bin] [--fast-baud 921600] verify <firmware-qspi.bin> [--offset SIZE]
   mono-uart-recovery --device /dev/ttyUSB0 [--stage1 mono-uart-recovery-stage1.bin] [--fast-baud 921600] erase [--offset SIZE] --length image|full|SIZE
-  mono-uart-recovery --device /dev/ttyUSB0 [--stage1 mono-uart-recovery-stage1.bin] [--fast-baud 921600] crc32 --offset SIZE --length SIZE"
+  mono-uart-recovery --device /dev/ttyUSB0 [--stage1 mono-uart-recovery-stage1.bin] [--fast-baud 921600] crc32 --offset SIZE --length SIZE
+
+Restore selectors:
+  --byte-range START..END selects all eraseblocks touched by the inclusive byte range.
+  Mono Gateway NOR eraseblocks are 64 KiB.
+  --partitions accepts: rcw-bl2, uboot, uboot-env, fman-ucode, recovery-dtb, kernel-initramfs"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_info() -> proto::DeviceInfo {
+        proto::DeviceInfo {
+            flash_size: 64 * MIB,
+            image_size: 32 * MIB,
+            erase_size: 64 * 1024,
+            write_granule: 1,
+            max_data: proto::MAX_DATA_LEN as u16,
+            jedec_id: 0,
+        }
+    }
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn byte_range_parser_accepts_decimal_and_hex() {
+        assert_eq!(
+            parse_byte_range_arg("1048576..0x1fffff").unwrap(),
+            InclusiveByteRange {
+                start: MIB,
+                end: 2 * MIB - 1
+            }
+        );
+    }
+
+    #[test]
+    fn byte_range_resolves_to_touched_eraseblocks() {
+        let selector = RestoreSelector::ByteRange(InclusiveByteRange {
+            start: MIB + 1,
+            end: MIB + 64 * 1024,
+        });
+        let ranges = resolve_restore_ranges(&test_info(), 0, 32 * MIB, &selector).unwrap();
+
+        assert_eq!(
+            ranges,
+            vec![RestoreRange {
+                image_offset: MIB,
+                flash_offset: MIB,
+                write_len: 2 * 64 * 1024,
+                erase_len: 2 * 64 * 1024,
+            }]
+        );
+    }
+
+    #[test]
+    fn partitions_use_corrected_mono_gateway_layout() {
+        let selector = RestoreSelector::Partitions(vec![
+            "uboot".to_string(),
+            "uboot-env".to_string(),
+            "kernel-initramfs".to_string(),
+        ]);
+        let ranges = resolve_restore_ranges(&test_info(), 0, 32 * MIB, &selector).unwrap();
+
+        assert_eq!(
+            ranges,
+            vec![
+                RestoreRange {
+                    image_offset: MIB,
+                    flash_offset: MIB,
+                    write_len: 3 * MIB,
+                    erase_len: 3 * MIB,
+                },
+                RestoreRange {
+                    image_offset: 10 * MIB,
+                    flash_offset: 10 * MIB,
+                    write_len: 22 * MIB,
+                    erase_len: 22 * MIB,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn restore_parser_rejects_multiple_selectors() {
+        let err = parse_command(&args(&[
+            "restore",
+            "firmware.bin",
+            "--partitions=uboot",
+            "--byte-range=0..0xffff",
+        ]))
+        .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("restore accepts only one of --byte-range or --partitions"));
+    }
+
+    #[test]
+    fn restore_parser_accepts_partition_selector() {
+        let command = parse_command(&args(&[
+            "restore",
+            "firmware.bin",
+            "--partitions=rcw-bl2,uboot",
+        ]))
+        .unwrap();
+
+        match command {
+            Command::Restore { selector, .. } => {
+                assert_eq!(
+                    selector,
+                    RestoreSelector::Partitions(vec!["rcw-bl2".to_string(), "uboot".to_string()])
+                );
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn restore_parser_rejects_unallocated_partition() {
+        let err = parse_command(&args(&[
+            "restore",
+            "firmware.bin",
+            "--partitions=unallocated",
+        ]))
+        .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("unknown NOR partition 'unallocated'"));
+    }
 }
